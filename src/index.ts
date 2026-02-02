@@ -12,6 +12,14 @@
 // Agent 核心
 export { Agent, type AgentConfig, type AgentCallbacks, type RunResult } from "./agent.js";
 
+// 事件流
+export {
+  type AgentEventStream,
+  type AgentEventPayload,
+  emitAgentEvent,
+  onAgentEvent,
+} from "./agent-events.js";
+
 // 会话管理
 export { SessionManager, type Message, type ContentBlock } from "./session.js";
 

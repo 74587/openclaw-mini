@@ -19,6 +19,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
+import crypto from "node:crypto";
 import type { Tool, ToolContext } from "./tools/types.js";
 import { builtinTools } from "./tools/builtin.js";
 import { SessionManager, type Message, type ContentBlock } from "./session.js";
@@ -33,6 +34,7 @@ import {
 } from "./session-key.js";
 import { enqueueInLane, resolveGlobalLane, resolveSessionLane } from "./command-queue.js";
 import { filterToolsByPolicy, mergeToolPolicies, type ToolPolicy } from "./tool-policy.js";
+import { emitAgentEvent } from "./agent-events.js";
 
 // ============== 类型定义 ==============
 
@@ -97,6 +99,8 @@ export interface AgentCallbacks {
 }
 
 export interface RunResult {
+  /** 本次运行 ID */
+  runId?: string;
   /** 最终文本 */
   text: string;
   /** 总轮次 */
@@ -282,6 +286,20 @@ export class Agent {
 
     return enqueueInLane(sessionLane, () =>
       enqueueInLane(globalLane, async () => {
+        const runId = crypto.randomUUID();
+        const startedAt = Date.now();
+        emitAgentEvent({
+          runId,
+          stream: "lifecycle",
+          sessionKey,
+          agentId: this.agentId,
+          data: {
+            phase: "start",
+            startedAt,
+            model: this.model,
+          },
+        });
+        try {
         // 加载历史
         const history = await this.sessions.load(sessionKey);
 
@@ -367,6 +385,15 @@ export class Agent {
             if (event.type === "content_block_delta") {
               if (event.delta.type === "text_delta") {
                 callbacks?.onTextDelta?.(event.delta.text);
+                emitAgentEvent({
+                  runId,
+                  stream: "assistant",
+                  sessionKey,
+                  agentId: this.agentId,
+                  data: {
+                    delta: event.delta.text,
+                  },
+                });
               }
             }
           }
@@ -383,8 +410,29 @@ export class Agent {
               finalText = block.text;
               callbacks?.onTextComplete?.(block.text);
               assistantContent.push({ type: "text", text: block.text });
+              emitAgentEvent({
+                runId,
+                stream: "assistant",
+                sessionKey,
+                agentId: this.agentId,
+                data: {
+                  text: block.text,
+                  final: true,
+                },
+              });
             } else if (block.type === "tool_use") {
               callbacks?.onToolStart?.(block.name, block.input);
+              emitAgentEvent({
+                runId,
+                stream: "tool",
+                sessionKey,
+                agentId: this.agentId,
+                data: {
+                  phase: "start",
+                  name: block.name,
+                  input: block.input,
+                },
+              });
               assistantContent.push({
                 type: "tool_use",
                 id: block.id,
@@ -434,6 +482,17 @@ export class Agent {
             }
 
             callbacks?.onToolEnd?.(call.name, result);
+            emitAgentEvent({
+              runId,
+              stream: "tool",
+              sessionKey,
+              agentId: this.agentId,
+              data: {
+                phase: "end",
+                name: call.name,
+                output: result.length > 500 ? `${result.slice(0, 500)}...` : result,
+              },
+            });
             toolResults.push({
               type: "tool_result",
               tool_use_id: call.id,
@@ -460,13 +519,44 @@ export class Agent {
           );
         }
 
+        const endedAt = Date.now();
+        emitAgentEvent({
+          runId,
+          stream: "lifecycle",
+          sessionKey,
+          agentId: this.agentId,
+          data: {
+            phase: "end",
+            startedAt,
+            endedAt,
+            turns,
+            toolCalls: totalToolCalls,
+          },
+        });
+
         return {
+          runId,
           text: finalText,
           turns,
           toolCalls: totalToolCalls,
           skillTriggered,
           memoriesUsed,
         };
+        } catch (err) {
+          emitAgentEvent({
+            runId,
+            stream: "lifecycle",
+            sessionKey,
+            agentId: this.agentId,
+            data: {
+              phase: "error",
+              startedAt,
+              endedAt: Date.now(),
+              error: err instanceof Error ? err.message : String(err),
+            },
+          });
+          throw err;
+        }
       }),
     );
   }

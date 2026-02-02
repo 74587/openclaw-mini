@@ -4,7 +4,7 @@
  */
 
 import readline from "node:readline";
-import { Agent } from "./agent.js";
+import { Agent, onAgentEvent } from "./index.js";
 import { resolveSessionKey } from "./session-key.js";
 
 // ============== 颜色输出 ==============
@@ -22,6 +22,17 @@ const colors = {
 function color(text: string, c: keyof typeof colors): string {
   return `${colors[c]}${text}${colors.reset}`;
 }
+
+let unsubscribe: (() => void) | null = null;
+type RunMeta = {
+  startedAt?: number;
+  endedAt?: number;
+  model?: string;
+  turns?: number;
+  toolCalls?: number;
+  error?: string;
+};
+const runMetaById = new Map<string, RunMeta>();
 
 // ============== 主函数 ==============
 
@@ -53,6 +64,93 @@ async function main() {
     workspaceDir,
   });
 
+  // 仅追踪当前会话的运行，避免多会话事件串台
+  let activeRunId: string | null = null;
+  // 事件流默认开启：用于输出运行生命周期、工具调用与汇总信息
+  unsubscribe = onAgentEvent((evt) => {
+    if (evt.sessionKey !== sessionKey) {
+      return;
+    }
+    if (activeRunId && evt.runId !== activeRunId && evt.stream !== "lifecycle") {
+      return;
+    }
+    if (evt.stream === "lifecycle") {
+      const phase = typeof evt.data?.phase === "string" ? evt.data.phase : undefined;
+      if (phase === "start") {
+        activeRunId = evt.runId;
+        const meta = runMetaById.get(evt.runId) ?? {};
+        meta.startedAt =
+          typeof evt.data?.startedAt === "number" ? evt.data.startedAt : Date.now();
+        if (typeof evt.data?.model === "string") {
+          meta.model = evt.data.model;
+        }
+        runMetaById.set(evt.runId, meta);
+        const model = typeof evt.data?.model === "string" ? ` model=${evt.data.model}` : "";
+        console.error(color(`\n[event] run start id=${evt.runId}${model}`, "magenta"));
+        return;
+      }
+      if (phase === "end" && (!activeRunId || evt.runId === activeRunId)) {
+        activeRunId = null;
+        const meta = runMetaById.get(evt.runId) ?? {};
+        if (typeof evt.data?.startedAt === "number") {
+          meta.startedAt = evt.data.startedAt;
+        }
+        if (typeof evt.data?.endedAt === "number") {
+          meta.endedAt = evt.data.endedAt;
+        }
+        if (typeof evt.data?.turns === "number") {
+          meta.turns = evt.data.turns;
+        }
+        if (typeof evt.data?.toolCalls === "number") {
+          meta.toolCalls = evt.data.toolCalls;
+        }
+        runMetaById.set(evt.runId, meta);
+        const duration =
+          typeof evt.data?.startedAt === "number" && typeof evt.data?.endedAt === "number"
+            ? ` duration=${Math.max(0, evt.data.endedAt - evt.data.startedAt)}ms`
+            : "";
+        console.error(color(`[event] run end id=${evt.runId}${duration}\n`, "magenta"));
+        return;
+      }
+      if (phase === "error" && (!activeRunId || evt.runId === activeRunId)) {
+        activeRunId = null;
+        const meta = runMetaById.get(evt.runId) ?? {};
+        meta.endedAt = Date.now();
+        if (typeof evt.data?.error === "string") {
+          meta.error = evt.data.error;
+        }
+        runMetaById.set(evt.runId, meta);
+        const error = typeof evt.data?.error === "string" ? ` error=${evt.data.error}` : "";
+        console.error(color(`[event] run error id=${evt.runId}${error}\n`, "magenta"));
+      }
+      return;
+    }
+
+    // 工具调用事件：仅展示当前运行的开始/结束
+    if (evt.stream === "tool" && evt.runId === activeRunId) {
+      const phase = typeof evt.data?.phase === "string" ? evt.data.phase : undefined;
+      const name = typeof evt.data?.name === "string" ? evt.data.name : "unknown";
+      if (phase === "start") {
+        const input = evt.data?.input ? safePreview(evt.data.input, 120) : "";
+        console.error(color(`[event] tool start ${name}${input ? ` ${input}` : ""}`, "yellow"));
+      }
+      if (phase === "end") {
+        const output = typeof evt.data?.output === "string" ? ` ${evt.data.output}` : "";
+        console.error(color(`[event] tool end ${name}${output}`, "yellow"));
+      }
+      return;
+    }
+
+    // assistant 最终回复摘要（避免刷屏）
+    if (evt.stream === "assistant" && evt.runId === activeRunId) {
+      const isFinal = evt.data?.final === true;
+      if (isFinal && typeof evt.data?.text === "string") {
+        const length = evt.data.text.length;
+        console.error(color(`[event] assistant final chars=${length}`, "magenta"));
+      }
+    }
+  });
+
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -79,20 +177,23 @@ async function main() {
       try {
         const result = await agent.run(sessionKey, trimmed, {
           onTextDelta: (delta) => process.stdout.write(delta),
-          onToolStart: (name, input) => {
-            console.log(color(`\n  [工具] ${name}`, "yellow"));
-            const inputStr = JSON.stringify(input);
-            if (inputStr.length < 100) {
-              console.log(color(`  参数: ${inputStr}`, "dim"));
-            }
-          },
-          onToolEnd: (name, result) => {
-            const preview = result.slice(0, 200).replace(/\n/g, "\\n");
-            console.log(color(`  结果: ${preview}${result.length > 200 ? "..." : ""}`, "dim"));
-          },
         });
 
-        console.log(color(`\n\n  [${result.turns} 轮, ${result.toolCalls} 次工具调用]`, "dim"));
+        // 运行报告：从事件元数据汇总时间、工具次数等
+        const meta = result.runId ? runMetaById.get(result.runId) : undefined;
+        const duration =
+          meta?.startedAt && meta?.endedAt
+            ? Math.max(0, meta.endedAt - meta.startedAt)
+            : undefined;
+        const summaryParts = [
+          `id=${result.runId ?? "unknown"}`,
+          typeof duration === "number" ? `duration=${duration}ms` : "",
+          `turns=${result.turns}`,
+          `tools=${result.toolCalls}`,
+          typeof result.memoriesUsed === "number" ? `memories=${result.memoriesUsed}` : "",
+          `chars=${result.text.length}`,
+        ].filter(Boolean);
+        console.log(color(`\n\n  [${summaryParts.join(", ")}]`, "dim"));
       } catch (err) {
         console.error(color(`\n错误: ${(err as Error).message}`, "yellow"));
       }
@@ -133,6 +234,18 @@ function resolveSessionIdArg(args: string[]): string | undefined {
     return arg.trim() || undefined;
   }
   return undefined;
+}
+
+function safePreview(input: unknown, max = 120): string {
+  try {
+    const text = JSON.stringify(input);
+    if (!text) {
+      return "";
+    }
+    return text.length > max ? `${text.slice(0, max)}...` : text;
+  } catch {
+    return "";
+  }
 }
 
 async function handleCommand(cmd: string, agent: Agent, sessionKey: string) {
@@ -192,11 +305,12 @@ async function handleCommand(cmd: string, agent: Agent, sessionKey: string) {
   }
 }
 
-// 处理 Ctrl+C
-process.on("SIGINT", () => {
-  console.log(color("\n\n再见! 👋", "cyan"));
-  process.exit(0);
-});
+  // 处理 Ctrl+C
+  process.on("SIGINT", () => {
+    console.log(color("\n\n再见! 👋", "cyan"));
+    unsubscribe?.();
+    process.exit(0);
+  });
 
 main().catch((err) => {
   console.error("启动失败:", err);
