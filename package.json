@@ -15,7 +15,7 @@
     "example": "tsx examples/basic.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0"
+    "@mariozechner/pi-ai": "0.50.7"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

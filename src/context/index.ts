@@ -29,6 +29,7 @@ export {
   compactHistoryIfNeeded,
   computeAdaptiveChunkRatio,
   shouldTriggerCompaction,
+  type SummarizeFn,
   DEFAULT_COMPACTION_TRIGGER_RATIO,
   DEFAULT_SUMMARY_MAX_TOKENS,
   DEFAULT_CONTEXT_WINDOW_TOKENS,

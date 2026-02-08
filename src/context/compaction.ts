@@ -1,4 +1,3 @@
-import type Anthropic from "@anthropic-ai/sdk";
 import { createCompactionSummaryMessage, type Message } from "../session.js";
 import {
   estimateMessageTokens,
@@ -165,7 +164,17 @@ function formatFileOperations(readFiles: string[], modifiedFiles: string[]): str
   return `\n\n${sections.join("\n\n")}`;
 }
 
-type SummaryClient = Pick<Anthropic, "messages">;
+/**
+ * 摘要生成函数签名
+ *
+ * 解耦 compaction 与具体 LLM SDK:
+ * - 调用方通过 pi-ai 的 completeSimple 或任意 provider 实现
+ */
+export type SummarizeFn = (params: {
+  system: string;
+  userPrompt: string;
+  maxTokens: number;
+}) => Promise<string>;
 
 function normalizeParts(parts: number, messageCount: number): number {
   if (!Number.isFinite(parts) || parts <= 1) {
@@ -327,8 +336,7 @@ function serializeConversation(messages: Message[]): string {
 
 async function generateSummary(params: {
   messages: Message[];
-  client: SummaryClient;
-  model: string;
+  summarize: SummarizeFn;
   maxTokens: number;
   customInstructions?: string;
   previousSummary?: string;
@@ -344,32 +352,16 @@ async function generateSummary(params: {
   }
   prompt += basePrompt;
 
-  const response = await params.client.messages.create({
-    model: params.model,
-    max_tokens: params.maxTokens,
+  return params.summarize({
     system: SUMMARIZATION_SYSTEM_PROMPT,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
+    userPrompt: prompt,
+    maxTokens: params.maxTokens,
   });
-
-  const blocks = response.content ?? [];
-  let text = "";
-  for (const block of blocks) {
-    if (block.type === "text") {
-      text += block.text;
-    }
-  }
-  return text.trim();
 }
 
 async function summarizeChunks(params: {
   messages: Message[];
-  client: SummaryClient;
-  model: string;
+  summarize: SummarizeFn;
   maxTokens: number;
   maxChunkTokens: number;
   customInstructions?: string;
@@ -383,8 +375,7 @@ async function summarizeChunks(params: {
   for (const chunk of chunks) {
     summary = await generateSummary({
       messages: chunk,
-      client: params.client,
-      model: params.model,
+      summarize: params.summarize,
       maxTokens: params.maxTokens,
       customInstructions: params.customInstructions,
       previousSummary: summary,
@@ -395,8 +386,7 @@ async function summarizeChunks(params: {
 
 async function summarizeWithFallback(params: {
   messages: Message[];
-  client: SummaryClient;
-  model: string;
+  summarize: SummarizeFn;
   maxTokens: number;
   maxChunkTokens: number;
   contextWindow: number;
@@ -442,8 +432,7 @@ async function summarizeWithFallback(params: {
 
 export async function summarizeInStages(params: {
   messages: Message[];
-  client: SummaryClient;
-  model: string;
+  summarize: SummarizeFn;
   maxTokens: number;
   maxChunkTokens: number;
   contextWindow: number;
@@ -516,8 +505,7 @@ export function shouldTriggerCompaction(params: {
 }
 
 export async function buildCompactionSummary(params: {
-  client: SummaryClient;
-  model: string;
+  summarize: SummarizeFn;
   messages: Message[];
   contextWindowTokens: number;
   maxTokens?: number;
@@ -532,8 +520,7 @@ export async function buildCompactionSummary(params: {
 
   return summarizeInStages({
     messages: params.messages,
-    client: params.client,
-    model: params.model,
+    summarize: params.summarize,
     maxTokens,
     maxChunkTokens,
     contextWindow: params.contextWindowTokens,
@@ -542,8 +529,7 @@ export async function buildCompactionSummary(params: {
 }
 
 export async function compactHistoryIfNeeded(params: {
-  client: SummaryClient;
-  model: string;
+  summarize: SummarizeFn;
   messages: Message[];
   contextWindowTokens: number;
   pruningSettings?: Partial<ContextPruningSettings>;
@@ -571,8 +557,7 @@ export async function compactHistoryIfNeeded(params: {
   }
 
   let summary = await buildCompactionSummary({
-    client: params.client,
-    model: params.model,
+    summarize: params.summarize,
     messages: pruneResult.droppedMessages,
     contextWindowTokens: params.contextWindowTokens,
     maxTokens: params.maxTokens,

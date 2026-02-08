@@ -79,3 +79,32 @@ export {
   grepTool,
   memorySaveTool,
 } from "./tools/index.js";
+
+// Provider 抽象层（基于 @mariozechner/pi-ai）
+export {
+  type Api,
+  type Provider,
+  type Model,
+  type StreamFunction,
+  type StreamOptions,
+  type AssistantMessage,
+  type AssistantMessageEvent,
+  type AssistantMessageEventStream,
+  type ThinkingLevel,
+  type StopReason,
+  stream,
+  streamSimple,
+  streamAnthropic,
+  getModel,
+  getModels,
+  isContextOverflow,
+  createAssistantMessageEventStream,
+  FailoverError,
+  isFailoverError,
+  type FailoverReason,
+  type RetryOptions,
+  retryAsync,
+  isContextOverflowError,
+  classifyFailoverReason,
+  describeError,
+} from "./provider/index.js";

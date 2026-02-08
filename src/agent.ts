@@ -18,7 +18,6 @@
  *   }
  */
 
-import Anthropic from "@anthropic-ai/sdk";
 import crypto from "node:crypto";
 import type { Tool, ToolContext } from "./tools/types.js";
 import { builtinTools } from "./tools/builtin.js";
@@ -32,6 +31,7 @@ import {
   pruneContextMessages,
   estimateMessagesTokens,
   type PruneResult,
+  type SummarizeFn,
 } from "./context/index.js";
 import {
   CONTEXT_WINDOW_HARD_MIN_TOKENS,
@@ -50,14 +50,148 @@ import {
 import { enqueueInLane, resolveGlobalLane, resolveSessionLane, setLaneConcurrency } from "./command-queue.js";
 import { filterToolsByPolicy, mergeToolPolicies, type ToolPolicy } from "./tool-policy.js";
 import { emitAgentEvent } from "./agent-events.js";
+import type {
+  Model,
+  StreamFunction,
+  SimpleStreamOptions,
+  Context as PiContext,
+  ToolCall as PiToolCall,
+  Message as PiMessage,
+  TextContent as PiTextContent,
+} from "@mariozechner/pi-ai";
+import { streamSimple, completeSimple, getModel } from "@mariozechner/pi-ai";
+import {
+  retryAsync,
+  isContextOverflowError,
+  isRateLimitError,
+  describeError,
+} from "./provider/errors.js";
+
+
+// ============== 消息格式转换 ==============
+
+/**
+ * 将内部 Message[] 转换为 pi-ai 的 Message[]
+ *
+ * pi-ai 使用三种 role: "user" / "assistant" / "toolResult"
+ * 我们的内部格式: role 只有 "user" / "assistant"，tool_result 嵌在 user 消息的 content 中
+ *
+ * 转换规则:
+ * - user + string content → PiUserMessage
+ * - user + ContentBlock[] 含 tool_result → 拆分为独立 PiToolResultMessage
+ * - user + ContentBlock[] 含 text → PiUserMessage
+ * - assistant + ContentBlock[] → PiAssistantMessage（需转换 tool_use → ToolCall）
+ */
+function convertMessagesToPi(
+  messages: Message[],
+  modelInfo: { api: string; provider: string; id: string },
+): PiMessage[] {
+  // assistant 消息需要填充的元数据（pi-ai 要求完整结构，但这些字段不影响 stream 行为）
+  const emptyUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const result: PiMessage[] = [];
+
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      if (typeof msg.content === "string") {
+        result.push({
+          role: "user",
+          content: msg.content,
+          timestamp: msg.timestamp,
+        });
+        continue;
+      }
+
+      // ContentBlock[] — 分离 text 和 tool_result
+      const textParts: PiTextContent[] = [];
+      for (const block of msg.content) {
+        if (block.type === "text" && block.text) {
+          textParts.push({ type: "text", text: block.text });
+        } else if (block.type === "tool_result") {
+          result.push({
+            role: "toolResult",
+            toolCallId: block.tool_use_id ?? "",
+            toolName: block.name ?? "",
+            content: [{ type: "text", text: typeof block.content === "string" ? block.content : "" }],
+            isError: false,
+            timestamp: msg.timestamp,
+          });
+        }
+      }
+      if (textParts.length > 0) {
+        result.push({
+          role: "user",
+          content: textParts,
+          timestamp: msg.timestamp,
+        });
+      }
+    } else {
+      // assistant
+      if (typeof msg.content === "string") {
+        result.push({
+          role: "assistant",
+          content: [{ type: "text", text: msg.content }],
+          api: modelInfo.api,
+          provider: modelInfo.provider,
+          model: modelInfo.id,
+          usage: emptyUsage,
+          stopReason: "stop",
+          timestamp: msg.timestamp,
+        });
+        continue;
+      }
+
+      const piContent: (PiTextContent | PiToolCall)[] = [];
+      for (const block of msg.content) {
+        if (block.type === "text" && block.text) {
+          piContent.push({ type: "text", text: block.text });
+        } else if (block.type === "tool_use") {
+          piContent.push({
+            type: "toolCall",
+            id: block.id ?? "",
+            name: block.name ?? "",
+            arguments: block.input ?? {},
+          });
+        }
+      }
+
+      result.push({
+        role: "assistant",
+        content: piContent,
+        api: modelInfo.api,
+        provider: modelInfo.provider,
+        model: modelInfo.id,
+        usage: emptyUsage,
+        stopReason: "stop",
+        timestamp: msg.timestamp,
+      });
+    }
+  }
+
+  return result;
+}
 
 // ============== 类型定义 ==============
 
 export interface AgentConfig {
-  /** Anthropic API Key */
-  apiKey: string;
-  /** 模型 ID */
+  /** API Key（向后兼容：未指定 streamFn 时作为 Anthropic key 使用） */
+  apiKey?: string;
+  /** 模型 ID（向后兼容：未指定 model 对象时用于创建默认 Anthropic model） */
   model?: string;
+  /**
+   * Provider 流式调用函数
+   *
+   * 对应 OpenClaw: pi-agent-core → Agent.streamFn
+   * - 不指定则默认使用 pi-ai 的 streamSimple（自动路由到对应 provider）
+   * - 可替换为任意自定义 StreamFunction
+   */
+  streamFn?: StreamFunction;
+  /**
+   * 模型定义
+   *
+   * 对应 OpenClaw: pi-ai → Model<TApi>
+   * - 不指定则通过 getModel("anthropic", modelId) 获取
+   */
+  modelDef?: Model<any>;
   /** Agent ID（默认 main） */
   agentId?: string;
   /** 系统提示 */
@@ -72,6 +206,8 @@ export interface AgentConfig {
     allowExec?: boolean;
     allowWrite?: boolean;
   };
+  /** 温度参数（0-1，对应 OpenClaw: agents.defaults.models[provider/model].params.temperature） */
+  temperature?: number;
   /** 最大循环次数 */
   maxTurns?: number;
   /** 会话存储目录 */
@@ -163,8 +299,16 @@ const DEFAULT_SYSTEM_PROMPT = `你是一个编程助手 Agent。
 // ============== Agent 核心类 ==============
 
 export class Agent {
-  private client: Anthropic;
-  private model: string;
+  /**
+   * Provider 流式调用函数
+   *
+   * 对应 OpenClaw: pi-agent-core/agent.d.ts → Agent.streamFn
+   * - 可在运行时替换（如 failover 切换 provider）
+   */
+  streamFn: StreamFunction;
+  private modelDef: Model<any>;
+  private apiKey?: string;
+  private temperature?: number;
   private agentId: string;
   private baseSystemPrompt: string;
   private tools: Tool[];
@@ -200,14 +344,29 @@ export class Agent {
    */
   private runAbortControllers = new Map<string, AbortController>();
 
+  /**
+   * Steering 消息队列 (sessionKey → messages[])
+   *
+   * 对应 OpenClaw: pi-agent-core → Agent.steeringQueue
+   * - 用户在工具执行期间发送新消息时入队
+   * - 每次工具执行完毕后检查，若非空则跳过剩余工具
+   * - 队列中的消息作为下一个 user turn 处理
+   */
+  private steeringQueues = new Map<string, string[]>();
+
   constructor(config: AgentConfig) {
-    this.client = new Anthropic({ apiKey: config.apiKey });
-    this.model = config.model ?? "claude-sonnet-4-20250514";
+    // Provider 初始化（对应 OpenClaw: attempt.ts → activeSession.agent.streamFn）
+    // 优先使用显式传入的 streamFn / modelDef，否则通过 pi-ai 获取 Anthropic 模型
+    const modelId = config.model ?? "claude-sonnet-4-20250514";
+    this.modelDef = config.modelDef ?? getModel("anthropic", modelId as any);
+    this.streamFn = config.streamFn ?? streamSimple;
     this.agentId = normalizeAgentId(config.agentId ?? "main");
     this.baseSystemPrompt = config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.tools = config.tools ?? builtinTools;
     this.maxTurns = config.maxTurns ?? 20;
     this.workspaceDir = config.workspaceDir ?? process.cwd();
+    this.apiKey = config.apiKey;
+    this.temperature = config.temperature;
     this.toolPolicy = config.toolPolicy;
     this.contextTokens = Math.max(
       1,
@@ -240,6 +399,28 @@ export class Agent {
   }
 
   /**
+   * 创建 SummarizeFn（用于 compaction）
+   *
+   * 通过 pi-ai 的 completeSimple 实现，与 Agent 当前的 model/apiKey 绑定
+   * 对应 OpenClaw: compaction 走独立的 summarization call
+   */
+  private createSummarizeFn(): SummarizeFn {
+    const model = this.modelDef;
+    const apiKey = this.apiKey;
+    return async (params) => {
+      const result = await completeSimple(model, {
+        systemPrompt: params.system,
+        messages: [{ role: "user", content: params.userPrompt, timestamp: Date.now() }],
+      }, { maxTokens: params.maxTokens, apiKey });
+      const text = result.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("");
+      return text.trim();
+    };
+  }
+
+  /**
    * 上下文压缩：裁剪 + 可选摘要
    */
   private async prepareMessagesForRun(params: {
@@ -251,9 +432,10 @@ export class Agent {
     summary?: string;
     summaryMessage?: Message;
   }> {
+    // compaction 通过 SummarizeFn 抽象，不依赖特定 SDK
+    // 底层使用 pi-ai 的 completeSimple，自动路由到当前 model 对应的 provider
     const compacted = await compactHistoryIfNeeded({
-      client: this.client,
-      model: this.model,
+      summarize: this.createSummarizeFn(),
       messages: params.messages,
       contextWindowTokens: this.contextTokens,
     });
@@ -454,6 +636,11 @@ export class Agent {
         const runAbortController = new AbortController();
         this.runAbortControllers.set(runId, runAbortController);
 
+        // 初始化 steering 队列（保留已有的 pending 消息）
+        if (!this.steeringQueues.has(sessionKey)) {
+          this.steeringQueues.set(sessionKey, []);
+        }
+
         emitAgentEvent({
           runId,
           stream: "lifecycle",
@@ -462,7 +649,7 @@ export class Agent {
           data: {
             phase: "start",
             startedAt,
-            model: this.model,
+            model: this.modelDef.id,
           },
         });
         try {
@@ -548,6 +735,8 @@ export class Agent {
         let totalToolCalls = 0;
         let finalText = "";
         const currentMessages = [...history, userMsg];
+        // Context overflow compact 只尝试一次（对应 OpenClaw: overflowCompactionAttempted）
+        let overflowCompactionAttempted = false;
 
         // ===== Compaction: run 开始前做一次 =====
         // 对应 OpenClaw: compaction 仅在 context overflow 时触发
@@ -557,7 +746,7 @@ export class Agent {
           sessionKey,
           runId,
         });
-        const compactionSummary = prep.summaryMessage;
+        let compactionSummary = prep.summaryMessage;
         if (prep.summary) {
           let firstKeptEntryId: string | undefined;
           for (const msg of prep.pruned.messages) {
@@ -607,84 +796,162 @@ export class Agent {
             messagesForModel = [compactionSummary, ...messagesForModel];
           }
 
-          // 调用 LLM (流式)
+          // ===== 调用 LLM (流式) — 通过 Provider 抽象 + 重试 =====
+          // 对应 OpenClaw: pi-agent-core → agent.streamFn(model, context, options)
           // abort 检查: 如果已中止则跳过 LLM 调用
           if (runAbortController.signal.aborted) {
             break;
           }
 
-          const stream = this.client.messages.stream({
-            model: this.model,
-            max_tokens: 4096,
-            system: systemPrompt,
+          // 构造 pi-ai Context（统一格式，不依赖特定 SDK）
+          // 对应 OpenClaw: pi-ai/types.d.ts → Context
+          const piContext: PiContext = {
+            systemPrompt,
+            messages: convertMessagesToPi(messagesForModel, this.modelDef),
+            // pi-ai Tool.parameters 要求 TypeBox TSchema，用 as any 桥接普通 JSON Schema
             tools: toolsForRun.map((t) => ({
               name: t.name,
               description: t.description,
-              input_schema: t.inputSchema,
+              parameters: t.inputSchema as any,
             })),
-            messages: messagesForModel.map((m) => ({
-              role: m.role,
-              content: m.content,
-            })) as Anthropic.MessageParam[],
-          });
+          };
 
-          // 处理流式响应
-          for await (const event of stream) {
-            if (runAbortController.signal.aborted) break;
-            if (event.type === "content_block_delta") {
-              if (event.delta.type === "text_delta") {
-                callbacks?.onTextDelta?.(event.delta.text);
-                emitAgentEvent({
-                  runId,
-                  stream: "assistant",
-                  sessionKey,
-                  agentId: this.agentId,
-                  data: {
-                    delta: event.delta.text,
-                  },
-                });
-              }
-            }
-          }
-
-          // 获取完整响应
-          // 对应 OpenClaw: attempt.ts → abortable(activeSession.prompt(...))
-          const response = await abortable(stream.finalMessage(), runAbortController.signal);
-
-          // 解析响应
+          // ===== 带重试的 LLM 调用 =====
+          // 对应 OpenClaw: run.ts 主循环的错误处理分支
+          // - rate_limit → 指数退避重试（最多 3 次）
+          // - context overflow → auto-compact → 重试一次
+          // - 其他错误 → 直接抛出
           const assistantContent: ContentBlock[] = [];
           const toolCalls: { id: string; name: string; input: Record<string, unknown> }[] = [];
           const turnTextParts: string[] = [];
 
-          for (const block of response.content) {
-            if (block.type === "text") {
-              turnTextParts.push(block.text);
-              assistantContent.push({ type: "text", text: block.text });
-            } else if (block.type === "tool_use") {
-              callbacks?.onToolStart?.(block.name, block.input);
+          // ===== Context Overflow → Auto-Compact → Retry =====
+          // 对应 OpenClaw: run.ts:372-431 — isContextOverflowError 分支
+          // retryAsync 处理 rate_limit，context overflow 在外层单独处理
+          try {
+            await retryAsync(
+              async () => {
+                // 清空上次重试的残留
+                assistantContent.length = 0;
+                toolCalls.length = 0;
+                turnTextParts.length = 0;
+
+                const streamOpts: SimpleStreamOptions = {
+                  maxTokens: this.modelDef.maxTokens,
+                  signal: runAbortController.signal,
+                  apiKey: this.apiKey,
+                  ...(this.temperature !== undefined ? { temperature: this.temperature } : {}),
+                };
+                const eventStream = this.streamFn(this.modelDef, piContext, streamOpts);
+
+                for await (const event of eventStream) {
+                  if (runAbortController.signal.aborted) break;
+
+                  switch (event.type) {
+                    case "text_delta":
+                      callbacks?.onTextDelta?.(event.delta);
+                      emitAgentEvent({
+                        runId,
+                        stream: "assistant",
+                        sessionKey,
+                        agentId: this.agentId,
+                        data: { delta: event.delta },
+                      });
+                      break;
+
+                    case "text_end":
+                      turnTextParts.push(event.content);
+                      assistantContent.push({ type: "text", text: event.content });
+                      break;
+
+                    case "toolcall_start":
+                      break;
+
+                    case "toolcall_end": {
+                      // pi-ai ToolCall 用 arguments 字段
+                      const tc = event.toolCall;
+                      const tcArgs = tc.arguments as Record<string, unknown>;
+                      callbacks?.onToolStart?.(tc.name, tcArgs);
+                      emitAgentEvent({
+                        runId,
+                        stream: "tool",
+                        sessionKey,
+                        agentId: this.agentId,
+                        data: { phase: "start", name: tc.name, input: tcArgs },
+                      });
+                      assistantContent.push({
+                        type: "tool_use",
+                        id: tc.id,
+                        name: tc.name,
+                        input: tcArgs,
+                      });
+                      toolCalls.push({
+                        id: tc.id,
+                        name: tc.name,
+                        input: tcArgs,
+                      });
+                      break;
+                    }
+                  }
+                }
+
+                await abortable(eventStream.result(), runAbortController.signal);
+              },
+              {
+                attempts: 3,
+                minDelayMs: 300,
+                maxDelayMs: 30_000,
+                jitter: 0.1,
+                label: "llm-call",
+                shouldRetry: (err) => {
+                  if (runAbortController.signal.aborted) return false;
+                  const msg = describeError(err);
+                  if (isRateLimitError(msg)) return true;
+                  return false;
+                },
+                onRetry: ({ attempt, delay, error }) => {
+                  emitAgentEvent({
+                    runId,
+                    stream: "lifecycle",
+                    sessionKey,
+                    agentId: this.agentId,
+                    data: {
+                      phase: "retry",
+                      attempt,
+                      delay,
+                      error: describeError(error),
+                    },
+                  });
+                },
+              },
+            );
+          } catch (llmError) {
+            // Context overflow: 自动 compact 后重试一次
+            // 对应 OpenClaw: run.ts → overflowCompactionAttempted 标记
+            const errorText = describeError(llmError);
+            if (isContextOverflowError(errorText) && !overflowCompactionAttempted) {
+              overflowCompactionAttempted = true;
               emitAgentEvent({
                 runId,
-                stream: "tool",
+                stream: "lifecycle",
                 sessionKey,
                 agentId: this.agentId,
-                data: {
-                  phase: "start",
-                  name: block.name,
-                  input: block.input,
-                },
+                data: { phase: "context_overflow_compact", error: errorText },
               });
-              assistantContent.push({
-                type: "tool_use",
-                id: block.id,
-                name: block.name,
-                input: block.input as Record<string, unknown>,
+              // 触发 compaction
+              const overflowPrep = await this.prepareMessagesForRun({
+                messages: currentMessages,
+                sessionKey,
+                runId,
               });
-              toolCalls.push({
-                id: block.id,
-                name: block.name,
-                input: block.input as Record<string, unknown>,
-              });
+              if (overflowPrep.summary && overflowPrep.summaryMessage) {
+                compactionSummary = overflowPrep.summaryMessage;
+                // 不 break，让 while 循环继续下一轮（重新 prune + 重新调用 LLM）
+                turns--; // 抵消本轮 turns++，此轮不算有效 turn
+                continue;
+              }
             }
+            throw llmError;
           }
 
           // 保存 assistant 消息
@@ -719,9 +986,12 @@ export class Agent {
             break;
           }
 
-          // 执行工具
-          totalToolCalls += toolCalls.length;
+          // ===== 执行工具（串行 + steering 中断检测） =====
+          // 对应 OpenClaw: pi-agent-core → 工具串行执行，每个工具完成后检查 steeringQueue
+          // - 当前工具执行完毕后如果 steering 队列非空，跳过剩余工具
+          // - 已执行的工具结果正常保留，未执行的完全跳过
           const toolResults: ContentBlock[] = [];
+          let steered = false;
 
           for (const call of toolCalls) {
             const tool = toolsForRun.find((t) => t.name === call.name);
@@ -737,6 +1007,7 @@ export class Agent {
               result = `未知工具: ${call.name}`;
             }
 
+            totalToolCalls++;
             callbacks?.onToolEnd?.(call.name, result);
             emitAgentEvent({
               runId,
@@ -752,11 +1023,27 @@ export class Agent {
             toolResults.push({
               type: "tool_result",
               tool_use_id: call.id,
+              name: call.name,
               content: result,
             });
+
+            // ===== Steering 检查 =====
+            // 对应 OpenClaw: agent loop 在 tool_execution_end 后检查 steeringQueue
+            const steeringQueue = this.steeringQueues.get(sessionKey);
+            if (steeringQueue && steeringQueue.length > 0) {
+              steered = true;
+              emitAgentEvent({
+                runId,
+                stream: "lifecycle",
+                sessionKey,
+                agentId: this.agentId,
+                data: { phase: "steering", pendingMessages: steeringQueue.length },
+              });
+              break; // 跳过剩余工具
+            }
           }
 
-          // 添加工具结果
+          // 添加已执行的工具结果
           const resultMsg: Message = {
             role: "user",
             content: toolResults,
@@ -764,6 +1051,26 @@ export class Agent {
           };
           await this.sessions.append(sessionKey, resultMsg);
           currentMessages.push(resultMsg);
+
+          // ===== 处理 steering 消息 =====
+          // 对应 OpenClaw: steering 消息作为下一个 user turn
+          if (steered) {
+            const steeringQueue = this.steeringQueues.get(sessionKey);
+            if (steeringQueue && steeringQueue.length > 0) {
+              // 取出所有 steering 消息合并为一个 user turn
+              const steeringText = steeringQueue.join("\n");
+              steeringQueue.length = 0;
+
+              const steeringMsg: Message = {
+                role: "user",
+                content: steeringText,
+                timestamp: Date.now(),
+              };
+              await this.sessions.append(sessionKey, steeringMsg);
+              currentMessages.push(steeringMsg);
+              // 不 break，让 while 循环继续下一轮（LLM 会看到 steering 消息）
+            }
+          }
         }
 
         // 记忆写入: 不再自动保存每轮对话
@@ -810,6 +1117,7 @@ export class Agent {
         } finally {
           // 清理 AbortController 引用
           this.runAbortControllers.delete(runId);
+          // 不清空 steeringQueues：可能有下一次 run 还在排队的消息
         }
       }),
     );
@@ -833,6 +1141,25 @@ export class Agent {
       for (const controller of this.runAbortControllers.values()) {
         controller.abort();
       }
+    }
+  }
+
+  /**
+   * 向运行中的会话注入 steering 消息
+   *
+   * 对应 OpenClaw: pi-agent-core → session.steer(text) / agent.steeringQueue
+   * - 在工具串行执行期间调用，当前工具完成后生效
+   * - 剩余未执行的工具被跳过
+   * - steering 消息作为下一个 user turn 进入对话
+   *
+   * 典型场景: 用户在 Agent 执行多个工具时发送了新消息
+   */
+  steer(sessionKey: string, text: string): void {
+    const queue = this.steeringQueues.get(sessionKey);
+    if (queue) {
+      queue.push(text);
+    } else {
+      this.steeringQueues.set(sessionKey, [text]);
     }
   }
 
