@@ -12,13 +12,20 @@
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
     "chat": "tsx src/cli.ts chat",
+    "gateway": "tsx src/gateway/gateway-cli.ts serve",
+    "gateway:serve": "tsx src/gateway/gateway-cli.ts serve",
+    "gateway:connect": "tsx src/gateway/gateway-cli.ts connect",
+    "channel:telegram": "tsx src/channels/channel-cli.ts telegram",
     "example": "tsx examples/basic.ts"
   },
   "dependencies": {
-    "@mariozechner/pi-ai": "0.50.7"
+    "@mariozechner/pi-ai": "0.50.7",
+    "grammy": "^1.41.1",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.21.0",
     "typescript": "^5.7.0"
   },
