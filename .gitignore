@@ -6,4 +6,4 @@ dist/
 .idea
 .vscode
 .env
-.openclaw-mini
+.openclaw-mini/
