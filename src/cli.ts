@@ -304,6 +304,10 @@ async function main() {
         printSystemLine(`compaction: dropped ${event.droppedMessages} messages`);
         break;
 
+      case "memory_flush":
+        printSystemLine(`memory flush: saved ${event.saved} memories before compaction`);
+        break;
+
       case "subagent_summary": {
         const l = event.label ? ` (${event.label})` : "";
         printSystemLine(`subagent${l}: ${event.summary.slice(0, 120)}`);

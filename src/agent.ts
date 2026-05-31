@@ -22,7 +22,7 @@
 
 import crypto from "node:crypto";
 import type { Tool, ToolContext } from "./tools/types.js";
-import { builtinTools } from "./tools/builtin.js";
+import { builtinTools, memorySaveTool } from "./tools/builtin.js";
 import { wrapToolWithAbortSignal } from "./tools/abort.js";
 import { SessionManager, type Message } from "./session.js";
 import { MemoryManager, type MemorySearchResult } from "./memory.js";
@@ -57,8 +57,14 @@ import {
 import type { MiniAgentEvent } from "./agent-events.js";
 import { runAgentLoop } from "./agent-loop.js";
 import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
-import type { Model, StreamFunction, ThinkingLevel } from "@mariozechner/pi-ai";
+import type { Model, StreamFunction, ThinkingLevel, Context as PiContext } from "@mariozechner/pi-ai";
 import { streamSimple, completeSimple, getModel, getEnvApiKey } from "@mariozechner/pi-ai";
+import { convertMessagesToPi } from "./message-convert.js";
+import {
+  shouldRunMemoryFlush,
+  MEMORY_FLUSH_PROMPT,
+  MEMORY_FLUSH_SYSTEM_PROMPT,
+} from "./memory-flush.js";
 
 // ============== 类型定义 ==============
 
@@ -255,6 +261,14 @@ export class Agent {
    * - 队列中的消息作为下一个 user turn 处理
    */
   private steeringQueues = new Map<string, string[]>();
+
+  /**
+   * 已刷写记忆的 session（压缩发生后重置）
+   *
+   * 对应 OpenClaw: SessionEntry.memoryFlushCompactionCount
+   * - 同一压缩周期内只刷写一次，避免重复消耗 LLM 调用
+   */
+  private memoryFlushedSessions = new Set<string>();
 
   /**
    * Tool Result Guard
@@ -459,6 +473,62 @@ export class Agent {
       summary: compacted.summary,
       summaryMessage: compacted.summaryMessage,
     };
+  }
+
+  /**
+   * 压缩前记忆刷写（pre-compaction memory flush）
+   *
+   * 对应 OpenClaw: src/auto-reply/reply/agent-runner-memory.ts → runMemoryFlushIfNeeded()
+   * - 在 compaction 之前触发：给模型一次机会把 durable 信息写入记忆，避免被摘要冲掉
+   * - 走 completeSimple 单次调用（不递归 this.run，避免 sessionLane 重入死锁）
+   * - 模型自行决定是否调 memory_save；结果不回传、不污染主会话历史（元操作）
+   * - 失败不阻断主流程
+   */
+  private async runMemoryFlushIfNeeded(sessionKey: string, messages: Message[]): Promise<void> {
+    if (!this.enableMemory) return;
+    if (this.memoryFlushedSessions.has(sessionKey)) return;
+    if (!shouldRunMemoryFlush({ messages, contextWindowTokens: this.contextTokens })) return;
+
+    const flushUserMsg: Message = {
+      role: "user",
+      content: MEMORY_FLUSH_PROMPT,
+      timestamp: Date.now(),
+    };
+    const piContext: PiContext = {
+      systemPrompt: MEMORY_FLUSH_SYSTEM_PROMPT,
+      messages: convertMessagesToPi([...messages, flushUserMsg], this.modelDef),
+      tools: [
+        {
+          name: memorySaveTool.name,
+          description: memorySaveTool.description,
+          parameters: memorySaveTool.inputSchema as any,
+        },
+      ],
+    };
+
+    let saved = 0;
+    try {
+      // 不传 reasoning：刷写回合无需 extended thinking
+      const result = await completeSimple(this.modelDef, piContext, {
+        maxTokens: 1024,
+        apiKey: this.apiKey,
+      });
+      for (const block of result.content) {
+        if (block.type === "toolCall" && block.name === "memory_save") {
+          const content = (block.arguments as { content?: string } | undefined)?.content;
+          if (content) {
+            await this.memory.add(content, "memory");
+            saved++;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`记忆刷写失败: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    this.memoryFlushedSessions.add(sessionKey);
+    this.emit({ type: "memory_flush", sessionKey, saved });
   }
 
   /**
@@ -714,6 +784,9 @@ export class Agent {
 
           const currentMessages = [...history, userMsg];
 
+          // 压缩前记忆刷写：在 compaction 之前给模型机会保全 durable 信息
+          await this.runMemoryFlushIfNeeded(sessionKey, currentMessages);
+
           // Compaction: run 开始前做一次
           const prep = await this.prepareMessagesForRun({
             messages: currentMessages,
@@ -741,6 +814,8 @@ export class Agent {
             } else {
               console.warn("无法定位 compaction 的 firstKeptEntryId，已跳过记录。");
             }
+            // 压缩已发生，重置刷写标记，允许下一压缩周期再次刷写
+            this.memoryFlushedSessions.delete(sessionKey);
           }
 
           // 构建系统提示
