@@ -27,7 +27,6 @@ import type { EventStream } from "@mariozechner/pi-ai";
 import type { Tool, ToolContext } from "./tools/types.js";
 import type { Message, ContentBlock } from "./session.js";
 import type {
-  Model,
   StreamFunction,
   SimpleStreamOptions,
   Context as PiContext,
@@ -38,8 +37,11 @@ import {
   retryAsync,
   isContextOverflowError,
   isRateLimitError,
+  isFailoverErrorMessage,
+  classifyFailoverReason,
   describeError,
 } from "./provider/errors.js";
+import type { ProviderProfile } from "./provider/failover.js";
 import { pruneContextMessages } from "./context/index.js";
 import { createMiniAgentStream, type MiniAgentEvent, type MiniAgentResult } from "./agent-events.js";
 import { abortable } from "./tools/abort.js";
@@ -57,9 +59,11 @@ export interface AgentLoopParams {
   systemPrompt: string;
   toolsForRun: Tool[];
   toolCtx: ToolContext;
-  modelDef: Model<any>;
+  /** 可用的 provider 档位链（profiles[0] 为首选）；调用失败时按序故障转移 */
+  profiles: ProviderProfile[];
   streamFn: StreamFunction;
-  apiKey?: string;
+  /** 故障转移回调：通知 Agent 记录该 profile 的冷却 */
+  onProfileFailure?: (key: string, reason: string) => void;
   temperature?: number;
   /** 思考级别: 传入后启用 extended thinking */
   reasoning?: ThinkingLevel;
@@ -152,9 +156,9 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
       systemPrompt,
       toolsForRun,
       toolCtx,
-      modelDef,
+      profiles,
       streamFn,
-      apiKey,
+      onProfileFailure,
       temperature,
       reasoning,
       maxTurns,
@@ -171,6 +175,9 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
     let totalToolCalls = 0;
     let finalText = "";
     let overflowCompactionAttempted = false;
+    // Provider failover：当前档位 + 在链中的位置（粘性：切换后续轮继续用新档位）
+    let profileIndex = 0;
+    let current = profiles[0];
 
     try {
       // 对应 OpenClaw: 循环开始前检查 steering（用户可能在等待期间输入）
@@ -210,7 +217,7 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
           }
 
           // 构造 pi-ai Context
-          const piMessages = convertMessagesToPi(messagesForModel, modelDef);
+          const piMessages = convertMessagesToPi(messagesForModel, current.modelDef);
           const piContext: PiContext = {
             systemPrompt,
             messages: piMessages,
@@ -237,13 +244,13 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
                 finalAssistantMessage = undefined;
 
                 const streamOpts: SimpleStreamOptions = {
-                  maxTokens: modelDef.maxTokens,
+                  maxTokens: current.modelDef.maxTokens,
                   signal: abortSignal,
-                  apiKey,
+                  apiKey: current.apiKey,
                   ...(temperature !== undefined ? { temperature } : {}),
                   ...(reasoning ? { reasoning } : {}),
                 };
-                const eventStream = streamFn(modelDef, piContext, streamOpts);
+                const eventStream = streamFn(current.modelDef, piContext, streamOpts);
 
                 for await (const event of eventStream) {
                   if (abortSignal.aborted) break;
@@ -336,6 +343,19 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
                 turns--;
                 continue;
               }
+            }
+            // Provider failover → 切换到下一个 profile 重试本轮
+            // 对应 OpenClaw: model-fallback.ts —— rate_limit 已在 retryAsync 同档退避耗尽，
+            // 此时（限流/认证/欠费/格式错误）切换 provider；timeout 不在此列（errors.ts 已排除）
+            if (isFailoverErrorMessage(errorText) && profileIndex < profiles.length - 1) {
+              const reason = classifyFailoverReason(errorText) ?? "unknown";
+              onProfileFailure?.(current.key, reason);
+              profileIndex++;
+              const next = profiles[profileIndex];
+              stream.push({ type: "provider_failover", from: current.label, to: next.label, reason });
+              current = next;
+              turns--;
+              continue;
             }
             throw llmError;
           }

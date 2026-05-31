@@ -63,6 +63,7 @@ export type MiniAgentEvent =
   | { type: "steering"; pendingCount: number }
   | { type: "compaction"; summaryChars: number; droppedMessages: number }
   | { type: "memory_flush"; sessionKey: string; saved: number }
+  | { type: "provider_failover"; from: string; to: string; reason: string }
   | { type: "context_overflow_compact"; error: string }
   | { type: "retry"; attempt: number; delay: number; error: string }
   | { type: "subagent_summary"; childSessionKey: string; label?: string; task: string; summary: string }

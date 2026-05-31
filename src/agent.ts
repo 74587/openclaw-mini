@@ -65,6 +65,7 @@ import {
   MEMORY_FLUSH_PROMPT,
   MEMORY_FLUSH_SYSTEM_PROMPT,
 } from "./memory-flush.js";
+import { ProfileCooldown, type ProviderProfile } from "./provider/failover.js";
 
 // ============== 类型定义 ==============
 
@@ -99,6 +100,19 @@ export interface AgentConfig {
    * - 不指定则通过 getModel(provider, modelId) 获取
    */
   modelDef?: Model<any>;
+  /**
+   * Provider 故障转移链
+   *
+   * 对应 OpenClaw: agents/model-fallback.ts
+   * - 主 provider 调用失败（限流/认证/欠费/格式错误，超时除外）时按序切换
+   * - 故障 profile 进入指数退避冷却，期间跳过
+   */
+  fallbacks?: Array<{
+    provider?: string;
+    model: string;
+    apiKey?: string;
+    baseUrl?: string;
+  }>;
   /** Agent ID（默认 main） */
   agentId?: string;
   /** 系统提示 */
@@ -200,6 +214,15 @@ const DEFAULT_SYSTEM_PROMPT = `你是一个编程助手 Agent。
 - 简洁的语言
 - 代码使用 markdown 格式`;
 
+/**
+ * provider → pi-ai API 标识映射（代理场景下构造兼容 modelDef 用）
+ */
+const API_FOR_PROVIDER: Record<string, string> = {
+  anthropic: "anthropic-messages",
+  openai: "openai-completions",
+  google: "google-generative-ai",
+};
+
 // ============== Agent 核心类 ==============
 
 export class Agent {
@@ -211,6 +234,9 @@ export class Agent {
    */
   streamFn: StreamFunction;
   private modelDef: Model<any>;
+  /** Provider 档位链(主 + fallbacks)+ 冷却状态 */
+  private profiles: ProviderProfile[];
+  private cooldown: ProfileCooldown;
   private apiKey?: string;
   private temperature?: number;
   private reasoning?: ThinkingLevel;
@@ -293,59 +319,14 @@ export class Agent {
     const provider = config.provider ?? "anthropic";
     const modelId = config.model ?? (provider === "anthropic" ? "claude-sonnet-4-20250514" : undefined);
 
-    // 解析 Model 定义
-    // 代理场景下 model ID 可能不在 pi-ai 注册表中（如 "anthropic/claude-sonnet-4.5"）
-    // 此时根据 provider 构造兼容的 Model 定义
-    const API_FOR_PROVIDER: Record<string, string> = {
-      anthropic: "anthropic-messages",
-      openai: "openai-completions",
-      google: "google-generative-ai",
-    };
-    let modelDef: Model<any> | undefined = config.modelDef ?? getModel(provider as any, modelId as any);
-    if (!modelDef && modelId) {
-      const api = API_FOR_PROVIDER[provider];
-      if (!api) {
-        throw new Error(`未知 provider: ${provider}，请指定 modelDef。`);
-      }
-      modelDef = {
-        id: modelId,
-        name: modelId,
-        api,
-        provider,
-        baseUrl: config.baseUrl ?? "",
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200_000,
-        maxTokens: 8192,
-      };
-    }
-    if (!modelDef) {
-      throw new Error(`未知模型: provider=${provider} model=${modelId}`);
-    }
-    // 使用代理时剥离 Anthropic SDK 和 pi-ai 添加的非标准 headers
-    // 代理通常会拒绝 SDK 的 User-Agent / X-Stainless-* tracking headers
-    // Anthropic SDK applyHeadersMut: null → 删除, undefined → 跳过
-    if (config.baseUrl) {
-      this.modelDef = {
-        ...modelDef,
-        baseUrl: config.baseUrl,
-        headers: {
-          "User-Agent": null,
-          "X-Stainless-Lang": null,
-          "X-Stainless-Package-Version": null,
-          "X-Stainless-OS": null,
-          "X-Stainless-Arch": null,
-          "X-Stainless-Runtime": null,
-          "X-Stainless-Runtime-Version": null,
-          "anthropic-dangerous-direct-browser-access": null,
-          "anthropic-beta": null,
-          ...config.headers,
-        } as any,
-      };
-    } else {
-      this.modelDef = config.headers ? { ...modelDef, headers: { ...modelDef.headers, ...config.headers } as any } : modelDef;
-    }
+    // 解析主 Model 定义（代理场景下 model ID 可能不在 pi-ai 注册表中，由 buildModelDef 兜底构造）
+    this.modelDef = this.buildModelDef({
+      provider,
+      modelId,
+      baseUrl: config.baseUrl,
+      headers: config.headers,
+      modelDef: config.modelDef,
+    });
     this.streamFn = config.streamFn ?? streamSimple;
     this.agentId = normalizeAgentId(config.agentId ?? "main");
     this.baseSystemPrompt = config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
@@ -390,6 +371,31 @@ export class Agent {
 
     // Tool Result Guard（对应 OpenClaw: attempt.ts → guardSessionManager()）
     this.toolResultGuard = installSessionToolResultGuard(this.sessions);
+
+    // Provider 档位链：主 profile + fallbacks（对应 OpenClaw: model-fallback.ts）
+    const mainProfile: ProviderProfile = {
+      key: `${provider}/${this.modelDef.id}`,
+      label: `${provider}/${this.modelDef.id}`,
+      modelDef: this.modelDef,
+      apiKey: this.apiKey,
+    };
+    const fallbackProfiles: ProviderProfile[] = (config.fallbacks ?? []).map((fb) => {
+      const fbProvider = fb.provider ?? provider;
+      const fbModelDef = this.buildModelDef({
+        provider: fbProvider,
+        modelId: fb.model,
+        baseUrl: fb.baseUrl,
+        headers: config.headers,
+      });
+      return {
+        key: `${fbProvider}/${fbModelDef.id}`,
+        label: `${fbProvider}/${fbModelDef.id}`,
+        modelDef: fbModelDef,
+        apiKey: fb.apiKey ?? getEnvApiKey(fbProvider),
+      };
+    });
+    this.profiles = [mainProfile, ...fallbackProfiles];
+    this.cooldown = new ProfileCooldown();
   }
 
   // ============== 事件订阅（对齐 pi-agent-core Agent） ==============
@@ -419,6 +425,64 @@ export class Agent {
         // 忽略监听器错误，避免影响主流程
       }
     }
+  }
+
+  /**
+   * 构造 Model 定义（主 profile 与 fallbacks 共用）
+   *
+   * 代理场景下 model ID 可能不在 pi-ai 注册表中（如 "anthropic/claude-sonnet-4.5"），
+   * 此时根据 provider 构造兼容定义；有 baseUrl 时剥离代理通常拒绝的 SDK tracking headers。
+   */
+  private buildModelDef(params: {
+    provider: string;
+    modelId?: string;
+    baseUrl?: string;
+    headers?: Record<string, string | null>;
+    modelDef?: Model<any>;
+  }): Model<any> {
+    const { provider, modelId, baseUrl, headers, modelDef: explicit } = params;
+    let modelDef: Model<any> | undefined = explicit ?? getModel(provider as any, modelId as any);
+    if (!modelDef && modelId) {
+      const api = API_FOR_PROVIDER[provider];
+      if (!api) {
+        throw new Error(`未知 provider: ${provider}，请指定 modelDef。`);
+      }
+      modelDef = {
+        id: modelId,
+        name: modelId,
+        api,
+        provider,
+        baseUrl: baseUrl ?? "",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200_000,
+        maxTokens: 8192,
+      };
+    }
+    if (!modelDef) {
+      throw new Error(`未知模型: provider=${provider} model=${modelId}`);
+    }
+    // 使用代理时剥离 Anthropic SDK / pi-ai 的非标准 headers（代理常拒绝 User-Agent / X-Stainless-*）
+    if (baseUrl) {
+      return {
+        ...modelDef,
+        baseUrl,
+        headers: {
+          "User-Agent": null,
+          "X-Stainless-Lang": null,
+          "X-Stainless-Package-Version": null,
+          "X-Stainless-OS": null,
+          "X-Stainless-Arch": null,
+          "X-Stainless-Runtime": null,
+          "X-Stainless-Runtime-Version": null,
+          "anthropic-dangerous-direct-browser-access": null,
+          "anthropic-beta": null,
+          ...headers,
+        } as any,
+      };
+    }
+    return headers ? { ...modelDef, headers: { ...modelDef.headers, ...headers } as any } : modelDef;
   }
 
   /**
@@ -871,6 +935,10 @@ export class Agent {
                 }
               : undefined;
 
+          // 解析本次可用的 provider 档位链（跳过冷却中的；全冷却则降级用首选）
+          const available = this.cooldown.available(this.profiles);
+          const profilesForRun = available.length > 0 ? available : [this.profiles[0]];
+
           const stream = runAgentLoop({
             runId,
             sessionKey,
@@ -880,9 +948,9 @@ export class Agent {
             systemPrompt,
             toolsForRun,
             toolCtx,
-            modelDef: this.modelDef,
+            profiles: profilesForRun,
             streamFn: this.streamFn,
-            apiKey: this.apiKey,
+            onProfileFailure: (key, reason) => this.cooldown.markFailure(key, reason),
             temperature: this.temperature,
             reasoning: this.reasoning,
             maxTurns: this.maxTurns,

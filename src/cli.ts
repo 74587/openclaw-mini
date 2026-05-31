@@ -308,6 +308,10 @@ async function main() {
         printSystemLine(`memory flush: saved ${event.saved} memories before compaction`);
         break;
 
+      case "provider_failover":
+        printSystemLine(`failover: ${event.from} → ${event.to} (${event.reason})`, "error");
+        break;
+
       case "subagent_summary": {
         const l = event.label ? ` (${event.label})` : "";
         printSystemLine(`subagent${l}: ${event.summary.slice(0, 120)}`);
