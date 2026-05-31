@@ -18,6 +18,11 @@ function estimateBlockChars(block: ContentBlock): number {
   if (block.type === "tool_result") {
     return block.content?.length ?? 0;
   }
+  if (block.type === "thinking") {
+    // thinking block 不计入本地预算：Anthropic 会自动将历史 turn 的 thinking
+    // 从 context window 计算中剔除，本地估算与之保持一致
+    return 0;
+  }
   return 0;
 }
 

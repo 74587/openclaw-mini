@@ -9,6 +9,7 @@ import type { Message } from "./session.js";
 import type {
   Message as PiMessage,
   TextContent as PiTextContent,
+  ThinkingContent as PiThinkingContent,
   ToolCall as PiToolCall,
 } from "@mariozechner/pi-ai";
 
@@ -28,7 +29,8 @@ const EMPTY_USAGE = {
  * - user + string content → PiUserMessage
  * - user + ContentBlock[] 含 tool_result → 拆分为独立 PiToolResultMessage
  * - user + ContentBlock[] 含 text → PiUserMessage
- * - assistant + ContentBlock[] → PiAssistantMessage（tool_use → ToolCall）
+ * - assistant + ContentBlock[] → PiAssistantMessage（thinking → ThinkingContent, tool_use → ToolCall）
+ *   thinking block 保持在 content 最前（Anthropic extended thinking + tool use 约束）
  */
 export function convertMessagesToPi(
   messages: Message[],
@@ -85,9 +87,16 @@ export function convertMessagesToPi(
         continue;
       }
 
-      const piContent: (PiTextContent | PiToolCall)[] = [];
+      const piContent: (PiThinkingContent | PiTextContent | PiToolCall)[] = [];
       for (const block of msg.content) {
-        if (block.type === "text" && block.text) {
+        if (block.type === "thinking" && block.thinking) {
+          // thinking block 含 signature，原样回传以维持 extended thinking 推理连续性
+          piContent.push({
+            type: "thinking",
+            thinking: block.thinking,
+            thinkingSignature: block.thinkingSignature,
+          });
+        } else if (block.type === "text" && block.text) {
           piContent.push({ type: "text", text: block.text });
         } else if (block.type === "tool_use") {
           piContent.push({

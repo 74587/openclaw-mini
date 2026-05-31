@@ -32,6 +32,7 @@ import type {
   SimpleStreamOptions,
   Context as PiContext,
   ThinkingLevel,
+  AssistantMessage,
 } from "@mariozechner/pi-ai";
 import {
   retryAsync,
@@ -224,6 +225,8 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
           const assistantContent: ContentBlock[] = [];
           const toolCalls: { id: string; name: string; input: Record<string, unknown> }[] = [];
           const turnTextParts: string[] = [];
+          // 最终 assistant message：用于提取带 signature 的 thinking block（流事件不携带）
+          let finalAssistantMessage: AssistantMessage | undefined;
 
           try {
             await retryAsync(
@@ -231,6 +234,7 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
                 assistantContent.length = 0;
                 toolCalls.length = 0;
                 turnTextParts.length = 0;
+                finalAssistantMessage = undefined;
 
                 const streamOpts: SimpleStreamOptions = {
                   maxTokens: modelDef.maxTokens,
@@ -250,8 +254,9 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
                       break;
 
                     case "thinking_end":
-                      // thinking 内容保存到 assistant message（对齐 pi-agent-core）
-                      // 但不计入 turnTextParts（思考不是最终输出）
+                      // 不计入 turnTextParts（思考不是最终输出）
+                      // thinking block（含 signature）从 eventStream.result() 提取后写入
+                      // assistantContent，不在此累积——因为流事件不携带 signature
                       break;
 
                     case "text_delta":
@@ -298,7 +303,7 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
                 }
 
                 const result = eventStream.result();
-                await abortable(result, abortSignal);
+                finalAssistantMessage = await abortable(result, abortSignal);
               },
               {
                 attempts: 3,
@@ -333,6 +338,26 @@ export function runAgentLoop(params: AgentLoopParams): EventStream<MiniAgentEven
               }
             }
             throw llmError;
+          }
+
+          // 提取 thinking block（含 signature）放到 content 最前
+          // 对齐 pi-agent-core：Anthropic extended thinking + tool use 多轮场景下，
+          // 上一条 assistant message 必须原样回传带 signature 的 thinking block，否则 400。
+          // signature 只能从 result() 取（流事件不携带），且 thinking 必须在 content 开头。
+          if (finalAssistantMessage) {
+            const thinkingBlocks: ContentBlock[] = [];
+            for (const c of finalAssistantMessage.content) {
+              if (c.type === "thinking" && c.thinking) {
+                thinkingBlocks.push({
+                  type: "thinking",
+                  thinking: c.thinking,
+                  thinkingSignature: c.thinkingSignature,
+                });
+              }
+            }
+            if (thinkingBlocks.length > 0) {
+              assistantContent.unshift(...thinkingBlocks);
+            }
           }
 
           // 保存 assistant 消息
